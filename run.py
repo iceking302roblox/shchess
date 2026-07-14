@@ -83,7 +83,216 @@ except ImportError:
 # ============================================================
 # ONLINE TABLEBASE
 # ============================================================
-
+class ChessEngine:
+    """Stockfish engine using direct subprocess - WORKS with Cygwin + Windows"""
+    
+    def __init__(self, engine_path=None):
+        if engine_path is None:
+            # Try multiple locations
+            paths = [
+                "/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe",
+                "./stockfish.exe",
+                "stockfish.exe",
+                "/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish-pgo.exe",
+                "./stockfish-pgo.exe",
+            ]
+            for path in paths:
+                if os.path.isfile(path):
+                    engine_path = path
+                    break
+        
+        self.engine_path = engine_path
+        self.process = None
+        self.stdin = None
+        self.stdout = None
+        self.initialized = False
+        self.queue = queue.Queue()
+        self.running = False
+        self.reader_thread = None
+        
+        if not self.engine_path or not os.path.isfile(self.engine_path):
+            print(f"ERROR: Stockfish not found!")
+            return
+        
+        self._init_engine()
+    
+    def _init_engine(self):
+        try:
+            self.process = subprocess.Popen(
+                [self.engine_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            self.stdin = self.process.stdin
+            self.stdout = self.process.stdout
+            self.running = True
+            
+            self.reader_thread = threading.Thread(target=self._reader, daemon=True)
+            self.reader_thread.start()
+            
+            self._write("uci")
+            if not self._wait_for("uciok", 5.0):
+                raise Exception("No UCI response")
+            
+            self._write("setoption name Threads value 4")
+            self._write("setoption name Hash value 256")
+            self._write("isready")
+            if not self._wait_for("readyok", 5.0):
+                raise Exception("Engine not ready")
+            
+            self.initialized = True
+            print("✓ Stockfish ready!")
+            
+        except Exception as e:
+            print(f"Engine init failed: {e}")
+            self._cleanup()
+    
+    def _reader(self):
+        while self.running and self.stdout:
+            try:
+                line = self.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    self.queue.put(line)
+            except:
+                break
+    
+    def _write(self, cmd):
+        if self.stdin:
+            try:
+                self.stdin.write(cmd + "\n")
+                self.stdin.flush()
+            except:
+                pass
+    
+    def _wait_for(self, text, timeout):
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                line = self.queue.get(timeout=0.1)
+                if text in line:
+                    return True
+            except queue.Empty:
+                continue
+        return False
+    
+    def _cleanup(self):
+        self.running = False
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1.0)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
+        self.process = None
+        self.stdin = None
+        self.stdout = None
+        self.initialized = False
+    
+    def analyze(self, board, depth=20, time_limit=1.0):
+        if not self.initialized:
+            return {'error': 'Engine not initialized', 'success': False}
+        
+        try:
+            # Clear old responses
+            while not self.queue.empty():
+                try:
+                    self.queue.get_nowait()
+                except:
+                    break
+            
+            self._write(f"position fen {board.fen()}")
+            self._write(f"go depth {depth} movetime {int(time_limit * 1000)}")
+            
+            result = {'score': None, 'pv': [], 'depth': 0, 'bestmove': None, 'success': False}
+            start = time.time()
+            timeout = time_limit + 2.0
+            
+            while time.time() - start < timeout:
+                try:
+                    line = self.queue.get(timeout=0.05)
+                    
+                    if 'score cp' in line:
+                        m = re.search(r'score cp ([-\d]+)', line)
+                        if m:
+                            result['score'] = int(m.group(1)) / 100.0
+                    
+                    if 'score mate' in line:
+                        m = re.search(r'score mate (\d+)', line)
+                        if m:
+                            result['score'] = f"Mate in {m.group(1)}"
+                    
+                    if 'depth ' in line:
+                        m = re.search(r'depth (\d+)', line)
+                        if m:
+                            result['depth'] = int(m.group(1))
+                    
+                    if 'pv ' in line:
+                        pv_start = line.find('pv ') + 3
+                        result['pv'] = line[pv_start:].strip().split()[:5]
+                    
+                    if line.startswith('bestmove'):
+                        parts = line.split()
+                        if len(parts) > 1:
+                            result['bestmove'] = parts[1]
+                        result['success'] = True
+                        break
+                        
+                except queue.Empty:
+                    continue
+            
+            if not result.get('success'):
+                return {'error': 'Analysis timeout', 'success': False}
+            
+            # Convert best move to SAN
+            best_move_san = None
+            if result.get('bestmove'):
+                try:
+                    move = chess.Move.from_uci(result['bestmove'])
+                    best_move_san = board.san(move)
+                except:
+                    best_move_san = result['bestmove']
+            
+            # Convert PV to SAN
+            pv_san = []
+            tmp = board.copy()
+            for move_uci in result.get('pv', []):
+                try:
+                    move = chess.Move.from_uci(move_uci)
+                    pv_san.append(tmp.san(move))
+                    tmp.push(move)
+                except:
+                    break
+            
+            return {
+                'success': True,
+                'evaluation': str(result.get('score', 'N/A')),
+                'pv': ' '.join(pv_san),
+                'depth': result.get('depth', depth),
+                'best_move': best_move_san,
+                'knps': 0
+            }
+            
+        except Exception as e:
+            return {'error': str(e), 'success': False}
+    
+    def get_best_move(self, board, time_limit=1.0):
+        result = self.analyze(board, depth=20, time_limit=time_limit)
+        if result.get('success'):
+            return result.get('best_move')
+        return None
+    
+    def close(self):
+        self._cleanup()
 class OnlineTablebase:
     """Query online endgame tablebases"""
     
@@ -387,85 +596,78 @@ class EndgameManager:
             print(f"Error loading endgame: {e}")
             return None
 
-
 class Analyse:
     """
-    Engine analysis with progress bar and KN/s (Kilonodes per second) display.
-    Similar to tqdm progress bar for chess analysis.
+    Engine analysis with progress bar and KN/s.
+    FIXED: Single continuous search for maximum speed.
     """
 
-    def __init__(self, engine_path: str = "./stockfish"):
+    def __init__(self, engine_path: str = "/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe"):
         self.engine_path = engine_path
         self.engine = None
         self.stop_flag = threading.Event()
         self.target_depth = 0
         self._last_nodes = 0
         self._last_ts = None
+        self._total_nodes = 0
+        self._last_score = "N/A"
 
     def start_engine(self):
         try:
-            self.engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
-            return True
+            self.engine = ChessEngine(self.engine_path)
+            # Force optimal settings
+            self.engine._write("setoption name Threads value 4")
+            self.engine._write("setoption name Hash value 512")
+            self.engine._write("setoption name Use NNUE value true")
+            self.engine._write("isready")
+            self.engine._wait_for("readyok", 5.0)
+            return self.engine.initialized
         except Exception as e:
-            print(f"Error starting engine: {e}")
+            print(f"Engine error: {e}")
             return False
 
     def stop_engine(self):
         if self.engine:
-            try:
-                self.engine.quit()
-            except Exception:
-                pass
+            self.engine.close()
         self.engine = None
 
     def stop(self):
         self.stop_flag.set()
+        if self.engine:
+            self.engine._write("stop")
 
-    def format_kilonodes(self, nodes: int) -> str:
+    def format_kilonodes(self, nodes):
         kn = nodes / 1000.0
-        if kn >= 1000:
-            return f"{kn/1000:.1f}M"
-        return f"{kn:.1f}K"
+        return f"{kn/1000:.1f}M" if kn >= 1000 else f"{kn:.1f}K"
 
-    def format_time(self, seconds: float) -> str:
-        mins = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{mins:02d}:{secs:02d}"
+    def format_time(self, seconds):
+        return f"{int(seconds//60):02d}:{int(seconds%60):02d}"
 
-    def draw_progress_bar(self, depth: int, nodes: int, elapsed: float, bar_width: int = 40):
-        progress = min(1.0, depth / self.target_depth) if self.target_depth > 0 else 0
-        filled = int(bar_width * progress)
-        now = time.time()
+    def draw_progress_bar(self, depth, nodes, elapsed, score="", knps=0):
+        progress = min(1.0, depth / self.target_depth) if self.target_depth else 0
+        filled = int(40 * progress)
+        bar = "=" * filled + "-" * (40 - filled)
+        pct = int(progress * 100)
 
         if self._last_ts is None:
             inst_kns = 0.0
         else:
-            dt = max(now - self._last_ts, 0.001)
+            dt = max(time.time() - self._last_ts, 0.001)
             dn = max(nodes - self._last_nodes, 0)
             inst_kns = (dn / dt) / 1000.0
-
-        avg_kns = (nodes / elapsed) / 1000.0
-
         self._last_nodes = nodes
-        self._last_ts = now
-        bar = "█" * filled + "░" * (bar_width - filled)
-        percentage = int(progress * 100)
+        self._last_ts = time.time()
 
+        avg_kns = knps if knps > 0 else (nodes / elapsed) / 1000.0 if elapsed > 0 else 0
         nodes_str = self.format_kilonodes(nodes)
         time_str = self.format_time(elapsed)
 
-        sys.stdout.write(
-            f"\r{TerminalColors.CYAN}"
-            f"Depth {depth}/{self.target_depth} |{bar}| "
-            f"{percentage}% | "
-            f"{avg_kns:6.1f} kN/s avg | "
-            f"{time_str}"
-            f"{TerminalColors.RESET}"
-        )
+        out = f"\rDepth {depth}/{self.target_depth} |{bar}| {pct}% | {avg_kns:6.1f} kN/s | {nodes_str} nodes | {time_str} {score}"
+        sys.stdout.write(out[:TERM_WIDTH])
         sys.stdout.flush()
 
     def analyse_position(self, board: chess.Board, depth: int = 20, multipv: int = 1):
-        if not self.engine:
+        if not self.engine or not self.engine.initialized:
             if not self.start_engine():
                 print("Engine not available")
                 return []
@@ -473,44 +675,93 @@ class Analyse:
         self.stop_flag.clear()
         self.target_depth = depth
         start = time.time()
-
-        results = []
-        last_nodes = 0
         last_depth = 0
-        last_info = None
+        total_nodes = 0
+        score_str = "N/A"
+        pv_moves = []
+        final_info = None
 
         try:
-            limit = chess.engine.Limit(depth=depth)
-            with self.engine.analysis(board, limit, info=chess.engine.INFO_ALL, multipv=multipv) as analysis:
-                for info in analysis:
-                    if self.stop_flag.is_set():
+            # Clear old responses
+            while not self.engine.queue.empty():
+                self.engine.queue.get_nowait()
+
+            self.engine._write(f"position fen {board.fen()}")
+            self.engine._write(f"go depth {depth}")
+
+            while True:
+                if self.stop_flag.is_set():
+                    self.engine._write("stop")
+                    break
+
+                try:
+                    line = self.engine.queue.get(timeout=0.05)
+                    if not line:
+                        continue
+
+                    # Parse depth
+                    if 'depth ' in line:
+                        m = re.search(r'depth (\d+)', line)
+                        if m:
+                            last_depth = max(last_depth, int(m.group(1)))
+
+                    # Parse nodes
+                    if 'nodes ' in line:
+                        m = re.search(r'nodes (\d+)', line)
+                        if m:
+                            total_nodes = max(total_nodes, int(m.group(1)))
+
+                    # Parse score
+                    if 'score cp' in line:
+                        m = re.search(r'score cp ([-\d]+)', line)
+                        if m:
+                            score_str = f"{int(m.group(1))/100:+.2f}"
+                    elif 'score mate' in line:
+                        m = re.search(r'score mate (\d+)', line)
+                        if m:
+                            score_str = f"Mate in {m.group(1)}"
+
+                    # Parse PV
+                    if 'pv ' in line:
+                        pv_start = line.find('pv ') + 3
+                        pv_moves = line[pv_start:].strip().split()[:5]
+
+                    # Update progress bar
+                    elapsed = max(time.time() - start, 0.001)
+                    knps = (total_nodes / elapsed) / 1000.0 if elapsed > 0 else 0
+                    self.draw_progress_bar(last_depth, total_nodes, elapsed, score_str, knps)
+
+                    # Check for bestmove
+                    if line.startswith('bestmove'):
+                        parts = line.split()
+                        bestmove = parts[1] if len(parts) > 1 else None
+                        final_info = {
+                            'depth': last_depth,
+                            'score': score_str,
+                            'pv': pv_moves,
+                            'bestmove': bestmove,
+                            'nodes': total_nodes,
+                            'time': int(elapsed * 1000),
+                            'knps': knps,
+                        }
                         break
 
-                    d = info.get("depth", last_depth)
-                    n = info.get("nodes", last_nodes)
+                except queue.Empty:
+                    if self.engine.process and self.engine.process.poll() is not None:
+                        break
 
-                    last_depth = d
-                    last_nodes = n
-                    last_info = info
+            print()  # newline after progress bar
 
-                    elapsed = max(time.time() - start, 0.001)
-                    self.draw_progress_bar(d, n, elapsed)
-
-            # newline after progress bar
-            print()
-
-            # Display best moves
-            if last_info:
+            if final_info:
                 print(f"\n{TerminalColors.GREEN}Analysis complete!{TerminalColors.RESET}")
-                
-                # Handle MultiPV results
-                if multipv > 1 and isinstance(last_info, list):
-                    for i, pv_info in enumerate(last_info[:multipv], 1):
-                        self._display_pv(board, pv_info, i)
-                else:
-                    self._display_pv(board, last_info, 1)
-                
-                return [last_info] if last_info else []
+                print(f"{TerminalColors.YELLOW}Score:{TerminalColors.RESET} {final_info['score']}")
+                if final_info['pv']:
+                    print(f"{TerminalColors.YELLOW}PV:{TerminalColors.RESET} {' '.join(final_info['pv'])}")
+                if final_info['nodes']:
+                    print(f"{TerminalColors.YELLOW}Nodes:{TerminalColors.RESET} {final_info['nodes']:,}")
+                    if final_info['knps']:
+                        print(f"{TerminalColors.YELLOW}Speed:{TerminalColors.RESET} {final_info['knps']:.0f} kN/s")
+                return [final_info]
             else:
                 print(f"{TerminalColors.YELLOW}No analysis results{TerminalColors.RESET}")
                 return []
@@ -518,46 +769,9 @@ class Analyse:
         except Exception as e:
             print(f"\n{TerminalColors.RED}Analysis error: {e}{TerminalColors.RESET}")
             return []
-    
-    def _display_pv(self, board: chess.Board, info: dict, line_num: int = 1):
-        """Display a single principal variation"""
-        try:
-            score = info.get("score")
-            pv = info.get("pv", [])
-            
-            if score and pv:
-                # Format score
-                if score.is_mate():
-                    mate_in = score.relative.mate()
-                    score_str = f"M{mate_in}"
-                else:
-                    cp = score.relative.score()
-                    score_str = f"{cp/100.0:+.2f}"
-                
-                # Format moves (first 5)
-                temp_board = board.copy()
-                move_strs = []
-                for i, move in enumerate(pv[:5]):
-                    if i >= 5:
-                        break
-                    move_strs.append(temp_board.san(move))
-                    temp_board.push(move)
-                
-                pv_str = " ".join(move_strs)
-                if len(pv) > 5:
-                    pv_str += " ..."
-                
-                # Display
-                print(f"{TerminalColors.YELLOW}Line {line_num}:{TerminalColors.RESET} {TerminalColors.BRIGHT_WHITE}{score_str}{TerminalColors.RESET} - {pv_str}")
-        except Exception as e:
-            print(f"Error displaying PV: {e}")
-    
+
     def analyze(self, board: chess.Board, depth: int = 20):
-        """Simple analyze method - shorthand for analyse_position"""
         return self.analyse_position(board, depth=depth, multipv=1)
-
-
-
 # ============================================================
 # BOARD EDITOR (CURSES-BASED)
 # ============================================================
@@ -887,58 +1101,267 @@ class EngineAnalyzer:
 # ============================================================
 
 class StockfishEngine:
-    """Simple Stockfish engine wrapper"""
+    """Stockfish engine using direct subprocess - NO python-chess engine control"""
     
-    def __init__(self, engine_path="./stockfish"):
+    def __init__(self, engine_path="/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish-pgo.exe"):
         self.engine_path = engine_path
-        self.engine = None
+        self.process = None
+        self.stdin = None
+        self.stdout = None
         self.initialized = False
+        self.queue = queue.Queue()
+        self.running = False
+        self.reader_thread = None
     
     def initialize(self):
-        """Initialize the engine"""
+        """Initialize the engine with direct subprocess"""
         if self.initialized:
             return True
         
+        if not os.path.exists(self.engine_path):
+            print(f"Engine not found: {self.engine_path}")
+            return False
+        
         try:
-            if not os.path.exists(self.engine_path):
-                return False
+            # Start Stockfish as subprocess
+            self.process = subprocess.Popen(
+                [self.engine_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
             
-            self.engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
+            self.stdin = self.process.stdin
+            self.stdout = self.process.stdout
+            self.running = True
+            
+            # Start reader thread
+            self.reader_thread = threading.Thread(target=self._reader, daemon=True)
+            self.reader_thread.start()
+            
+            # Initialize UCI
+            self._write("uci")
+            if not self._wait_for("uciok", 5.0):
+                raise Exception("No UCI response")
+            
+            # Configure for your CPU
+            self._write("setoption name Threads value 6")
+            self._write("setoption name Hash value 6860")
+            self._write("setoption name Use NNUE value true")
+            self._write("isready")
+            
+            if not self._wait_for("readyok", 5.0):
+                raise Exception("Engine not ready")
+            
             self.initialized = True
+            print("✓ Stockfish ready!")
             return True
+            
         except Exception as e:
             print(f"Engine init error: {e}")
+            self.close()
             return False
+    
+    def _reader(self):
+        """Read engine output in background"""
+        while self.running and self.stdout:
+            try:
+                line = self.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    self.queue.put(line)
+            except:
+                break
+    
+    def _write(self, cmd):
+        """Write command to engine"""
+        if self.stdin:
+            try:
+                self.stdin.write(cmd + "\n")
+                self.stdin.flush()
+            except:
+                pass
+    
+    def _wait_for(self, text, timeout):
+        """Wait for specific response"""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                line = self.queue.get(timeout=0.1)
+                if text in line:
+                    return True
+            except queue.Empty:
+                continue
+        return False
     
     def close(self):
         """Close the engine"""
-        if self.engine:
+        self.running = False
+        if self.process:
             try:
-                self.engine.quit()
-            except Exception:
-                pass
-            self.engine = None
-            self.initialized = False
+                self.process.terminate()
+                self.process.wait(timeout=1.0)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
+        self.process = None
+        self.stdin = None
+        self.stdout = None
+        self.initialized = False
     
-    def analyze(self, board, depth=20):
+    def analyze(self, board, depth=20, time_limit=1.0):
         """Analyze a position"""
         if not self.initialized:
             if not self.initialize():
                 return None
         
         try:
-            limit = chess.engine.Limit(depth=depth)
-            info = self.engine.analyse(board, limit)
+            # Clear old responses
+            while not self.queue.empty():
+                try:
+                    self.queue.get_nowait()
+                except:
+                    break
+            
+            # Send position
+            fen = board.fen()
+            self._write(f"position fen {fen}")
+            
+            # Start analysis
+            time_ms = int(time_limit * 1000)
+            self._write(f"go depth {depth} movetime {time_ms}")
+            
+            # Collect results
+            result = {
+                'score': None,
+                'pv': [],
+                'depth': 0,
+                'nodes': 0,
+                'time': 0,
+                'bestmove': None,
+                'success': False
+            }
+            
+            start = time.time()
+            timeout = time_limit + 2.0
+            
+            while time.time() - start < timeout:
+                try:
+                    line = self.queue.get(timeout=0.05)
+                    
+                    # Parse score
+                    if 'score cp' in line:
+                        m = re.search(r'score cp ([-\d]+)', line)
+                        if m:
+                            result['score'] = int(m.group(1)) / 100.0
+                    
+                    if 'score mate' in line:
+                        m = re.search(r'score mate (\d+)', line)
+                        if m:
+                            result['score'] = f"Mate in {m.group(1)}"
+                    
+                    # Parse PV
+                    if 'pv ' in line:
+                        pv_start = line.find('pv ') + 3
+                        result['pv'] = line[pv_start:].strip().split()[:5]
+                    
+                    # Parse depth
+                    if 'depth ' in line:
+                        m = re.search(r'depth (\d+)', line)
+                        if m:
+                            result['depth'] = int(m.group(1))
+                    
+                    # Parse nodes
+                    if 'nodes ' in line:
+                        m = re.search(r'nodes (\d+)', line)
+                        if m:
+                            result['nodes'] = int(m.group(1))
+                    
+                    # Parse time
+                    if 'time ' in line:
+                        m = re.search(r'time (\d+)', line)
+                        if m:
+                            result['time'] = int(m.group(1))
+                    
+                    # Check for bestmove
+                    if line.startswith('bestmove'):
+                        parts = line.split()
+                        if len(parts) > 1:
+                            result['bestmove'] = parts[1]
+                        result['success'] = True
+                        break
+                        
+                except queue.Empty:
+                    continue
+            
+            if not result.get('success'):
+                return None
+            
+            # Convert best move to SAN
+            best_move_san = None
+            if result.get('bestmove'):
+                try:
+                    move = chess.Move.from_uci(result['bestmove'])
+                    best_move_san = board.san(move)
+                except:
+                    best_move_san = result['bestmove']
+            
+            # Convert PV to SAN
+            pv_san = []
+            tmp = board.copy()
+            for move_uci in result.get('pv', []):
+                try:
+                    move = chess.Move.from_uci(move_uci)
+                    pv_san.append(tmp.san(move))
+                    tmp.push(move)
+                except:
+                    break
+            
+            # Calculate KNPS
+            nodes = result.get('nodes', 0)
+            time_ms = result.get('time', 1)
+            knps = 0
+            if nodes and time_ms > 0:
+                knps = (nodes / (time_ms / 1000.0)) / 1000.0
+            
+            # Return as a python-chess compatible info dict
+            info = {
+                'score': chess.engine.Score(chess.engine.Cp(int(result['score'] * 100)) if isinstance(result['score'], (int, float)) else None),
+                'pv': [chess.Move.from_uci(m) for m in result.get('pv', []) if m],
+                'depth': result.get('depth', depth),
+                'nodes': result.get('nodes', 0),
+                'time': result.get('time', 0),
+                'knps': knps,
+                'best_move': best_move_san,
+                'pv_san': ' '.join(pv_san),
+                'evaluation': f"{result['score']:+.2f}" if isinstance(result['score'], (int, float)) else str(result['score'])
+            }
+            
             return info
+            
         except Exception as e:
             print(f"Analysis error: {e}")
             return None
+    
+    def get_best_move(self, board, time_limit=1.0):
+        """Get best move as SAN"""
+        info = self.analyze(board, depth=20, time_limit=time_limit)
+        if info and info.get('best_move'):
+            return info['best_move']
+        return None
 
 class BoardEditorManager:
     """
     DROP-IN Board Editor Manager
     - curses based
-    - engine-safe
+    - FIXED: Uses subprocess-based ChessEngine
     - NO argparse
     - NO globals
     - NO __main__
@@ -954,7 +1377,7 @@ class BoardEditorManager:
         "e=eval | q=quit (auto-analyzing)"
     )
 
-    def __init__(self, terminal, board=None, engine_path="./stockfish"):
+    def __init__(self, terminal, board=None, engine_path="/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe"):
         self.terminal = terminal
         self.board = board.copy() if board else chess.Board()
         self.engine_path = engine_path
@@ -965,6 +1388,7 @@ class BoardEditorManager:
         self.undo_stack = []
         self.redo_stack = []
 
+        # FIXED: Use our ChessEngine instead of python-chess
         self.analyzer = None
         self.analysis_results = []
         self.show_analysis = True
@@ -1027,23 +1451,29 @@ class BoardEditorManager:
         self.A_ANALYSIS = curses.color_pair(7) | curses.A_BOLD
 
     # ======================================================
-    # ENGINE
+    # FIXED ENGINE - USES SUBPROCESS ChessEngine
     # ======================================================
 
     def _init_engine(self):
+        """FIXED: Use ChessEngine (subprocess-based) instead of python-chess"""
         if not os.path.exists(self.engine_path):
             self.analysis_info = "Engine not found"
             return
 
         try:
-            self.analyzer = chess.engine.SimpleEngine.popen_uci(self.engine_path)
-            self.analysis_running = True
-            self.analysis_thread = threading.Thread(
-                target=self._analysis_loop,
-                daemon=True
-            )
-            self.analysis_thread.start()
-            self.analysis_info = "Analyzing..."
+            # FIXED: Use our ChessEngine
+            self.analyzer = ChessEngine(self.engine_path)
+            if self.analyzer.initialized:
+                self.analysis_running = True
+                self.analysis_thread = threading.Thread(
+                    target=self._analysis_loop,
+                    daemon=True
+                )
+                self.analysis_thread.start()
+                self.analysis_info = "Analyzing..."
+            else:
+                self.analyzer = None
+                self.analysis_info = "Engine failed to start"
         except Exception as e:
             self.analyzer = None
             self.analysis_info = f"Engine error: {str(e)[:30]}"
@@ -1056,61 +1486,33 @@ class BoardEditorManager:
 
                 # Skip if position hasn't changed
                 if fen == self.last_fen:
-                    time.sleep(0.05)  # Small delay
+                    time.sleep(0.05)
                     continue
 
                 self.last_fen = fen
                 board_copy = chess.Board(fen)
 
                 # Use progressive depth for responsive updates
-                for depth in [12, 18, 22]:
+                for depth in [8, 12, 16, 20]:
                     if not self.analysis_running or fen != self.board.fen():
-                        break  # Position changed, restart
+                        break
                     
                     try:
-                        info = self.analyzer.analyse(
-                            board_copy,
-                            chess.engine.Limit(depth=depth),
-                            multipv=1
-                        )
-
-                        score = info.get("score")
-                        pv = info.get("pv", [])
-
-                        with self.analysis_lock:
-                            # Format score
-                            if score:
-                                pov = score.pov(board_copy.turn)
-                                if pov.is_mate():
-                                    mate_num = pov.mate()
-                                    score_str = f"M{abs(mate_num)}" if mate_num > 0 else f"M-{abs(mate_num)}"
-                                else:
-                                    cp = pov.score()
-                                    if cp is not None:
-                                        score_str = f"{cp/100:+.2f}"
-                                    else:
-                                        score_str = "?"
-                            else:
-                                score_str = "?"
-
-                            # Format best move
-                            self.best_move = None
-                            move_str = "None"
-                            if pv and len(pv) > 0:
-                                move = pv[0]
-                                try:
-                                    san_move = board_copy.san(move)
-                                    move_str = san_move
-                                    self.best_move = move
-                                except Exception:
-                                    try:
-                                        move_str = move.uci()
-                                        self.best_move = move
-                                    except Exception:
-                                        move_str = "?"
-
-                            # Update display with current depth
-                            self.analysis_info = f"Depth {depth}: {move_str} [{score_str}]"
+                        # FIXED: Use our ChessEngine analyze
+                        result = self.analyzer.analyze(board_copy, depth)
+                        
+                        if result.get('success'):
+                            # Parse score
+                            score_str = result.get('evaluation', '?')
+                            best_move = result.get('best_move', 'None')
+                            
+                            with self.analysis_lock:
+                                self.best_move = best_move
+                                self.analysis_info = f"Depth {depth}: {best_move} [{score_str}]"
+                        else:
+                            with self.analysis_lock:
+                                self.analysis_info = f"Analysis error at depth {depth}"
+                            break
 
                     except Exception as e:
                         with self.analysis_lock:
@@ -1216,18 +1618,15 @@ class BoardEditorManager:
         self.msg = "Cleared"
 
     def _engine_eval(self):
-        # Manual evaluation trigger
-        if self.analyzer:
+        """FIXED: Manual evaluation using subprocess engine"""
+        if self.analyzer and self.analyzer.initialized:
             try:
-                result = self.analyzer.analyse(
-                    self.board,
-                    chess.engine.Limit(depth=18)
-                )
-                score = result["score"].white()
-                if score.is_mate():
-                    self.msg = f"Mate in {score.mate()}"
+                result = self.analyzer.analyze(self.board, 18)
+                if result.get('success'):
+                    score = result.get('evaluation', 'N/A')
+                    self.msg = f"Score: {score}"
                 else:
-                    self.msg = f"Score: {score.score()/100:.2f}"
+                    self.msg = "Eval failed"
             except Exception as e:
                 self.msg = f"Eval error: {str(e)[:20]}"
         else:
@@ -1244,7 +1643,7 @@ class BoardEditorManager:
 
         if self.analyzer:
             try:
-                self.analyzer.quit()
+                self.analyzer.close()
             except:
                 pass
 
@@ -1307,8 +1706,6 @@ class BoardEditorManager:
 
         self.stdscr.refresh()
 
-        self.stdscr.refresh()
-
     def _splash(self):
         self.stdscr.clear()
         h, w = self.stdscr.getmaxyx()
@@ -1316,7 +1713,6 @@ class BoardEditorManager:
         self.stdscr.addstr(h//2, (w-len(text))//2, text, curses.A_BOLD)
         self.stdscr.refresh()
         time.sleep(1)
-
 
 # ============================================================
 # TERMINAL UTILITIES
@@ -1420,186 +1816,10 @@ class InputHandler:
 # FIXED CHESS ENGINE
 # ============================================================
 
-class ChessEngine:
-    """Fixed Stockfish engine wrapper with error handling"""
-    
-    def __init__(self):
-        self.engine = None
-        self.engine_path = self._find_engine()
-        self.initialized = False
-        if CHESS_AVAILABLE:
-            self._init_engine()
-    def _ensure_engine(self):
-        if self.engine and self.initialized:
-                return True
-
-        try:
-                if self.engine:
-                        self.engine.quit()
-        except:
-                pass
-
-        self.engine = None
-        self.initialized = False
-
-        print("Restarting Stockfish...")
-        self._init_engine()
-
-        return self.engine is not None and self.initialized
-
-    def _find_engine(self):
-        """
-        STRICT Termux mode:
-        - engine MUST be ./stockfish
-        - current working directory
-        - no extension
-        """
-
-        engine_path = "./stockfish"
-
-        if not os.path.isfile(engine_path):
-                print(f"{TerminalColors.RED}Stockfish not found:{TerminalColors.RESET} {engine_path}")
-                print(f"{TerminalColors.YELLOW}You must run SHCHESS from the directory containing ./stockfish{TerminalColors.RESET}")
-                return None
-
-        # Ensure executable (Android / Linux)
-        try:
-                os.chmod(engine_path, 0o755)
-        except Exception:
-                pass
-
-        print(f"{TerminalColors.GREEN}Using Stockfish:{TerminalColors.RESET} {engine_path}")
-        return engine_path
-
-    def _init_engine(self):
-        self.initialized = False
-        self.engine = None
-
-        engine_path = "./stockfish"
-
-        if not os.path.isfile(engine_path):
-                print("FATAL: ./stockfish not found")
-                return
-
-        try:
-                print("Starting Stockfish...")
-
-                engine = chess.engine.SimpleEngine.popen_uci(engine_path)
-
-                # Apply options ONCE, explicitly
-                engine.configure({
-                    "Threads": 113,
-                    "Hash": 7900,
-                    "MultiPV": 1,
-                    "Use NNUE": True
-                })
-                engine.ping()  # hard sync
-                self.engine = engine
-                self.initialized = True
-
-                print("Stockfish ready")
-                print("  Engine  : ./stockfish")
-                print("  Threads : 7")
-                print("  Hash    : 16 MB")
-                print("  NNUE    : ON")
-
-        except Exception as e:
-                print(f"Stockfish failed: {e}")
-                try:
-                        engine.quit()
-                except:
-                        pass
-                self.engine = None
-                self.initialized = False
-
-    def analyze(self, board, depth=20, time_limit=1.0):
-        if not CHESS_AVAILABLE:
-                return {'error': 'python-chess not available'}
-
-        # 🔥 THIS WAS MISSING
-        if not self._ensure_engine():
-                return {'error': 'Engine not available (restart failed)'}
-
-        root_board = board.copy(stack=False)
-
-        try:
-                info = self.engine.analyse(
-                        root_board,
-                        chess.engine.Limit(depth=depth, time=time_limit)
-                )
-                score = info.get("score")
-                evaluation = "N/A"
-                if score:
-                        pov = score.pov(board.turn)
-                        if pov.is_mate():
-                                mate = pov.mate()
-                                if mate is not None:
-                                        evaluation = f"Mate in {abs(mate)}"
-                        else:
-                                cp = pov.score(mate_score=100000)
-                                if cp is not None:
-                                        evaluation = f"{cp/100:+.2f}"
-
-                pv = info.get("pv", [])
-                pv_san = []
-                tmp = board.copy()
-                for move in pv[:5]:
-                        try:
-                                pv_san.append(tmp.san(move))
-                                tmp.push(move)
-                        except:
-                                break
-                nodes = info.get("nodes", 0) or 0
-                time_ms = info.get("time", 0) or 0
-
-                knps = 0.0
-                if nodes and time_ms > 0:
-                    knps = (nodes / (time_ms / 1000.0)) / 1000.0
 
 
-                return {
-                        'success': True,
-                        'evaluation': evaluation,
-                        'pv': ' '.join(pv_san),
-                        'depth': depth,
-                        'best_move': pv_san[0] if pv_san else None,
-                        'knps': knps
-                }
 
-        except chess.engine.EngineTerminatedError:
-                # Engine crashed → mark dead
-                self.initialized = False
-                self.engine = None
-                return {'error': 'Engine crashed'}
 
-        except Exception as e:
-                return {'error': str(e)}
-   
-    def get_best_move(self, board, time_limit=1.0):
-        """Get best move"""
-        if not CHESS_AVAILABLE:
-            return None
-        
-        if not self.initialized or not self.engine:
-            return None
-        
-        try:
-            result = self.engine.play(board, chess.engine.Limit(time=time_limit))
-            return board.san(result.move)
-        except:
-            return None
-    
-    def close(self):
-        """Close engine"""
-        if self.engine:
-            try:
-                self.engine.quit()
-            except Exception:
-                pass
-
-# ============================================================
-# FILE TYPER
-# ============================================================
 
 class FileTyper:
     """Type files with animation"""
@@ -2504,11 +2724,10 @@ class DatabaseExplorer:
         # Exit DB mode
         self.running = False
         print(f"\n{TerminalColors.YELLOW}[Database explorer closed — returned to chess]{TerminalColors.RESET}")
-
 class MacbethAnalysis:
     """
     Enhanced Macbeth analysis with per-move data storage.
-    SELF-CONTAINED: starts its own UCI engine (./stockfish) and shuts it down.
+    FIXED: Uses subprocess-based ChessEngine instead of python-chess.
     """
 
     # LICHESS CONSTANTS
@@ -2518,12 +2737,12 @@ class MacbethAnalysis:
     ACC_C = 3.1669
     EPS = 1e-9
 
-    def __init__(self, game, depth=24, engine_path="./stockfish"):
+    def __init__(self, game, depth=24, engine_path="/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe"):
         self.game = game
         self.depth = depth
         self.engine_path = engine_path
 
-        # UCI engine handle (python-chess SimpleEngine)
+        # FIXED: Use our subprocess-based engine
         self.engine = None
 
         # Core analysis data - STORED PER MOVE
@@ -2574,34 +2793,59 @@ class MacbethAnalysis:
         }
 
     # -------------------------
-    # ENGINE LIFECYCLE (NEW)
+    # FIXED ENGINE LIFECYCLE - USES SUBPROCESS
     # -------------------------
     def _start_engine(self) -> bool:
+        """Start engine using subprocess-based ChessEngine"""
         if self.engine:
             return True
         if not os.path.isfile(self.engine_path):
             self._send_progress(0, 0, 0.0, 0.0, f"Error: engine not found: {self.engine_path}")
             return False
         try:
-            self.engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
-            return True
+            # FIXED: Use our ChessEngine (subprocess-based)
+            self.engine = ChessEngine(self.engine_path)
+            if self.engine.initialized:
+                return True
+            else:
+                self.engine = None
+                self._send_progress(0, 0, 0.0, 0.0, "Error: Engine failed to initialize")
+                return False
         except Exception as e:
             self.engine = None
             self._send_progress(0, 0, 0.0, 0.0, f"Error starting engine: {e}")
             return False
 
     def _stop_engine(self):
-        eng = self.engine
-        self.engine = None
-        if eng:
+        if self.engine:
             try:
-                eng.quit()
+                self.engine.close()
             except Exception:
                 pass
+        self.engine = None
 
     # -------------------------
-    # Your existing helpers below (unchanged)
+    # FIXED ANALYSIS - USES SUBPROCESS ENGINE
     # -------------------------
+    def _analyze_position(self, board: chess.Board, depth: int) -> dict:
+        """Analyze a single position using subprocess engine"""
+        if not self.engine:
+            return {'score': None, 'pv': [], 'depth': 0, 'nodes': 0, 'time': 0}
+        
+        try:
+            result = self.engine.analyze(board, depth)
+            if result.get('success'):
+                return {
+                    'score': result.get('score'),
+                    'pv': result.get('pv'),
+                    'depth': result.get('depth', depth),
+                    'nodes': 0,
+                    'time': 0,
+                }
+            return {'score': None, 'pv': [], 'depth': 0, 'nodes': 0, 'time': 0}
+        except Exception:
+            return {'score': None, 'pv': [], 'depth': 0, 'nodes': 0, 'time': 0}
+
     def _format_tqdm_line(self, current, total, percent, accuracy, knps, san):
         bar_width = 12
         filled = int(bar_width * current / max(total, 1))
@@ -2667,16 +2911,9 @@ class MacbethAnalysis:
 
     def _extract_knps_live(self, info: dict) -> float:
         try:
-            nps = info.get("nps", None)
-            if nps is not None:
-                return float(nps) / 1000.0
-            nodes = info.get("nodes", 0) or 0
-            time_ms = info.get("time", 0) or 0
-            if nodes and time_ms and time_ms > 0:
-                return (nodes / (time_ms / 1000.0)) / 1000.0
+            return info.get('knps', 0.0)
         except Exception:
-            pass
-        return 0.0
+            return 0.0
 
     def _stream_analysis(
         self,
@@ -2691,49 +2928,61 @@ class MacbethAnalysis:
         engine_poll_interval: float = 0.01,
     ) -> dict:
         last_gui_emit = 0.0
-        last_knps = 0.0
         last_info = {}
 
         percent = (current_done / total_moves) * 100 if total_moves else 0.0
-        limit = chess.engine.Limit(depth=self.depth)
+        
+        # Analyze position using subprocess engine
+        try:
+            result = self._analyze_position(board, self.depth)
+            
+            # Parse score
+            score_val = result.get('score')
+            if score_val is not None:
+                # Parse score string if it's a string
+                if isinstance(score_val, str) and 'Mate' in score_val:
+                    # It's a mate score
+                    pass
+                elif isinstance(score_val, (int, float)):
+                    # It's a numeric score
+                    pass
+            
+            # Parse PV
+            pv = result.get('pv', [])
+            if isinstance(pv, str):
+                pv = pv.split()
+            
+            # Build info dict
+            info = {
+                'score': result.get('score'),
+                'pv': pv,
+                'depth': result.get('depth', self.depth),
+                'nodes': result.get('nodes', 0),
+                'time': result.get('time', 0),
+            }
+            
+            last_info = info
+        except Exception:
+            last_info = {}
 
-        with self._engine_lock:
-            with self.engine.analysis(board, limit, info=chess.engine.INFO_ALL) as analysis:
-                for info in analysis:
-                    if self.stop_event.is_set():
-                        break
+        # Update progress
+        if (time.time() - last_gui_emit) >= gui_emit_interval:
+            last_gui_emit = time.time()
+            line = self._format_tqdm_line(
+                current_done, total_moves, percent,
+                current_accuracy, 0, show_san
+            )
+            if phase:
+                line = f"{line} [{phase}]"
+            self._send_progress(current_done, total_moves, current_accuracy, 0, line)
 
-                    last_info = info or last_info
-                    k = self._extract_knps_live(info)
-                    if k:
-                        last_knps = k
-
-                    now = time.time()
-                    if (now - last_gui_emit) >= gui_emit_interval:
-                        last_gui_emit = now
-                        line = self._format_tqdm_line(
-                            current_done, total_moves, percent,
-                            current_accuracy, last_knps, show_san
-                        )
-                        if phase:
-                            line = f"{line} [{phase}]"
-                        self._send_progress(current_done, total_moves, current_accuracy, last_knps, line)
-
-                    time.sleep(engine_poll_interval)
-
-                try:
-                    final_info = analysis.info
-                except Exception:
-                    final_info = last_info
-
-        return final_info or last_info
+        return last_info
 
     def run_async(self, board: chess.Board, progress_callback=None):
         self.stop_event.clear()
         self.finished = False
         self._progress_callback = progress_callback
 
-        # NEW: engine starts before thread begins
         if not self._start_engine():
             self.finished = True
             return False
@@ -2750,13 +2999,12 @@ class MacbethAnalysis:
         try:
             self._run_analysis(board, progress_callback)
         finally:
-            # NEW: always shutdown engine
             self._stop_engine()
 
     def _run_analysis(self, board: chess.Board, progress_callback=None):
         """
         Main analysis loop - FIXED VERSION
-        Stores complete data for each move for navigation
+        Uses subprocess engine instead of python-chess
         """
         temp_board = board.copy()
         
@@ -2768,7 +3016,7 @@ class MacbethAnalysis:
         total_moves = len(moves)
         
         # Reset all data structures
-        self.move_data = []  # NEW: Store complete move data
+        self.move_data = []
         self.win_before = []
         self.win_after = []
         self.move_accuracy = []
@@ -2812,12 +3060,15 @@ class MacbethAnalysis:
                         engine_poll_interval=0.01
                     )
 
-                    score_before = info_before["score"].pov(temp_board.turn)
-                    cp_before = (
-                        10000 if score_before.is_mate() and score_before.mate() > 0
-                        else -10000 if score_before.is_mate()
-                        else score_before.score() or 0
-                    )
+                    score_before = info_before.get("score")
+                    # Convert score to centipawns
+                    if isinstance(score_before, (int, float)):
+                        cp_before = int(score_before * 100)
+                    elif isinstance(score_before, str) and 'Mate' in score_before:
+                        cp_before = 10000
+                    else:
+                        cp_before = 0
+                    
                     w_before = self._cp_to_win(cp_before)
                     
                     # Make the move
@@ -2835,23 +3086,22 @@ class MacbethAnalysis:
                         engine_poll_interval=0.01
                     )
 
-                    # POV from player who just moved
-                    score_after = info_after["score"].pov(not temp_board.turn)
-                    cp_after = (
-                        10000 if score_after.is_mate() and score_after.mate() > 0
-                        else -10000 if score_after.is_mate()
-                        else score_after.score() or 0
-                    )
-                    w_after = self._cp_to_win(cp_after)
+                    score_after = info_after.get("score")
+                    if isinstance(score_after, (int, float)):
+                        cp_after = int(score_after * 100)
+                    elif isinstance(score_after, str) and 'Mate' in score_after:
+                        cp_after = 10000
+                    else:
+                        cp_after = 0
+                    
+                    # Calculate win percentages (flip perspective since we're analyzing from opponent's side)
+                    w_after = self._cp_to_win(-cp_after)  # Flipped perspective
                     
                     # Calculate accuracy and macbeth
                     acc = self._move_accuracy(w_before, w_after)
                     macbeth = self._accuracy_to_macbeth(acc)
                     
-                    # Extract speed
-                    knps = self._extract_knps_live(info_after)
-                    
-                    # NEW: Store complete move data for navigation
+                    # Store complete move data
                     move_info = {
                         'index': idx,
                         'move_number': move_number,
@@ -2864,11 +3114,11 @@ class MacbethAnalysis:
                         'cp_after': cp_after,
                         'accuracy': acc,
                         'macbeth': macbeth,
-                        'knps': knps,
+                        'knps': 0,
                     }
                     self.move_data.append(move_info)
                     
-                    # Store in legacy arrays for compatibility
+                    # Store in legacy arrays
                     self.win_before.append(w_before)
                     self.win_after.append(w_after)
                     self.move_accuracy.append(acc)
@@ -2878,7 +3128,7 @@ class MacbethAnalysis:
                     # Update detailed data
                     self.detailed_data["moves"].append(move_san)
                     self.detailed_data["accuracies"].append(acc)
-                    self.detailed_data["knps"] = knps
+                    self.detailed_data["knps"] = 0
                     
                     # Calculate progress percentage
                     progress_pct = ((idx + 1) / total_moves) * 100
@@ -2889,10 +3139,10 @@ class MacbethAnalysis:
                         idx == len(moves) - 1):
                         
                         tqdm_line = self._format_tqdm_line(
-                            idx + 1, total_moves, progress_pct, acc, knps, move_san
+                            idx + 1, total_moves, progress_pct, acc, 0, move_san
                         )
                         
-                        self._send_progress(idx + 1, total_moves, acc, knps, tqdm_line)
+                        self._send_progress(idx + 1, total_moves, acc, 0, tqdm_line)
                         self.last_update_time = current_time
                     
                 except Exception as e:
@@ -2923,15 +3173,14 @@ class MacbethAnalysis:
                     
                     self._send_progress(idx + 1, total_moves, 50.0, 0.0, f"Error: {e}")
             
-            # Final calculations if not stopped
+            # Final calculations
             if not self.stop_event.is_set() and len(self.move_accuracy) > 0:
                 self.analysis_time = time.time() - start_time
                 
                 self.game_accuracy = self._game_accuracy()
                 base_macbeth = self._accuracy_to_macbeth(self.game_accuracy)
-                self.macbeth_number = base_macbeth * 5  # Apply multiplier
+                self.macbeth_number = base_macbeth * 5
                 
-                # Final summary
                 final_line = (
                     f"✓ Analysis complete! "
                     f"Time: {self.analysis_time:.1f}s | "
@@ -2942,13 +3191,11 @@ class MacbethAnalysis:
                 self._send_progress(
                     total_moves, total_moves, 
                     self.game_accuracy, 
-                    self.detailed_data.get("knps", 0.0),
+                    0,
                     final_line
                 )
                 
-                # Print newline after completion to move to next line
                 print()
-                
                 self.finished = True
             else:
                 self._send_progress(0, total_moves, 0.0, 0.0, "No moves analyzed")
@@ -2957,27 +3204,22 @@ class MacbethAnalysis:
         except Exception as e:
             error_line = f"✗ Analysis failed: {e}"
             self._send_progress(0, total_moves, 0.0, 0.0, error_line)
-            print()  # Newline after error
+            print()
         finally:
             if not self.finished:
                 self.finished = True
 
     def _send_progress(self, current, total, accuracy, knps, message):
         if len(message) > TERM_WIDTH:
-                message = message[:TERM_WIDTH - 1]
+            message = message[:TERM_WIDTH - 1]
 
-        # Carriage return overwrite - ALWAYS print to terminal
         out = "\r" + message.ljust(TERM_WIDTH)
         self._last_tqdm_line = out
         
-        # Print directly to terminal for tqdm effect
         print(out, end="", flush=True)
 
         if self._progress_callback:
-                self._progress_callback(current, total, accuracy, {
-                        "tqdm": out
-                })
-
+            self._progress_callback(current, total, accuracy, {"tqdm": out})
 
     def stop(self):
         """Stop ongoing analysis"""
@@ -2985,9 +3227,8 @@ class MacbethAnalysis:
         if self.analysis_thread and self.analysis_thread.is_alive():
             self.analysis_thread.join(timeout=1.0)
 
-    # NEW: Enhanced getter methods for navigation
+    # Getter methods
     def get_move_data(self, index: int) -> Optional[Dict[str, Any]]:
-        """Get complete data for a specific move"""
         if 0 <= index < len(self.move_data):
             return self.move_data[index].copy()
         return None
@@ -3004,7 +3245,6 @@ class MacbethAnalysis:
         return None
 
     def get_move_macbeth(self, index: int) -> Optional[float]:
-        """Get Macbeth number for specific move"""
         if 0 <= index < len(self.move_macbeth):
             return self.move_macbeth[index]
         return None
@@ -3013,7 +3253,6 @@ class MacbethAnalysis:
         return self.move_accuracy.copy()
 
     def get_all_move_data(self) -> List[Dict[str, Any]]:
-        """Get all move data"""
         return [m.copy() for m in self.move_data]
 
     def get_move_count(self) -> int:
@@ -3023,7 +3262,6 @@ class MacbethAnalysis:
         return self.detailed_data.copy()
 
     def get_progress_summary(self) -> str:
-        """Get human-readable progress summary"""
         if not self.move_accuracy:
             return "Analysis not started yet."
         
@@ -3052,7 +3290,6 @@ class MacbethAnalysis:
             ])
         
         return "\n".join(lines)
-
 # ============================================================
 # MOVE NAVIGATOR
 # ============================================================
@@ -3459,7 +3696,7 @@ class ChessTerminal:
         # -----------------------------
         # Engine / analysis - FIXED: Initialize engine
         # -----------------------------
-        self.engine = StockfishEngine("./stockfish")
+        self.engine = StockfishEngine("/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe")
         self.macbeth = None
 
         # -----------------------------
@@ -3488,7 +3725,7 @@ class ChessTerminal:
         # -----------------------------
         # New analysis engine (tqdm-like)
         # -----------------------------
-        self.analyser = Analyse("./stockfish")
+        self.analyser = Analyse("/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe")
         
         # Initialize
         self._setup_commands()
@@ -3560,7 +3797,7 @@ class ChessTerminal:
         self.config_manager.set_puzzle_enabled(True)
 
     def cmd_analyse(self, args):
-        """Analyse position with tqdm-like progress + KN/s using ./stockfish"""
+        """Analyse position with tqdm-like progress + KN/s using ./stockfish.exe"""
         if not CHESS_AVAILABLE:
             return f"{TerminalColors.RED}python-chess not available{TerminalColors.RESET}"
 
@@ -3571,8 +3808,8 @@ class ChessTerminal:
             except Exception:
                 pass
 
-        # only ./stockfish
-        self.analyser.engine_path = "./stockfish"
+        # only ./stockfish.exe
+        self.analyser.engine_path = "/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe"
 
         self.analyser.analyse_position(self.board, depth=depth)
         return ""
@@ -4468,17 +4705,54 @@ class ChessTerminal:
     def cmd_analyze(self, args):
         """Analyze position"""
         if not CHESS_AVAILABLE:
-            return f"{TerminalColors.RED}python-chess not available{TerminalColors.RESET}"
+                return f"{TerminalColors.RED}python-chess not available{TerminalColors.RESET}"
+        
+        # Use the FIXED ChessEngine
+        if not hasattr(self, 'engine') or not self.engine:
+                self.engine = ChessEngine()
         
         if not self.engine.initialized:
-            return f"{TerminalColors.RED}Engine not available{TerminalColors.RESET}"
+                return f"{TerminalColors.RED}Engine not available{TerminalColors.RESET}"
         
         depth = 20
         if args:
-            try:
-                depth = int(args[0])
-            except Exception:
-                pass
+                try:
+                        depth = int(args[0])
+                except Exception:
+                        pass
+        
+        print(f"{TerminalColors.YELLOW}Analyzing position to depth {depth}...{TerminalColors.RESET}")
+        
+        result = self.engine.analyze(self.board, depth)
+        
+        if 'error' in result:
+                return f"{TerminalColors.RED}Error: {result['error']}{TerminalColors.RESET}"
+        
+        output = []
+        output.append(f"{TerminalColors.GREEN}Evaluation: {result['evaluation']}{TerminalColors.RESET}")
+        if result.get('pv'):
+                output.append(f"{TerminalColors.CYAN}Best line: {result['pv']}{TerminalColors.RESET}")
+        if result.get('best_move'):
+                output.append(f"{TerminalColors.BRIGHT_WHITE}Best move: {result['best_move']}{TerminalColors.RESET}")
+        
+        return "\n".join(output)
+        """Analyze position"""
+        if not CHESS_AVAILABLE:
+                return f"{TerminalColors.RED}python-chess not available{TerminalColors.RESET}"
+        
+        # Initialize engine if not already
+        if not hasattr(self, 'engine') or not self.engine:
+                self.engine = ChessEngine()
+        
+        if not self.engine.initialized:
+                return f"{TerminalColors.RED}Engine not available{TerminalColors.RESET}"
+        
+        depth = 20
+        if args:
+                try:
+                        depth = int(args[0])
+                except Exception:
+                        pass
         
         print(f"{TerminalColors.YELLOW}Analyzing position to depth {depth}...{TerminalColors.RESET}")
         
@@ -4486,15 +4760,14 @@ class ChessTerminal:
         result = self.engine.analyze(self.board, depth)
         
         if 'error' in result:
-            return f"{TerminalColors.RED}Error: {result['error']}{TerminalColors.RESET}"
+                return f"{TerminalColors.RED}Error: {result['error']}{TerminalColors.RESET}"
         
         output = []
         output.append(f"{TerminalColors.GREEN}Evaluation: {result['evaluation']}{TerminalColors.RESET}")
         if result.get('pv'):
-            output.append(f"{TerminalColors.CYAN}Best line: {result['pv']}{TerminalColors.RESET}")
+                output.append(f"{TerminalColors.CYAN}Best line: {result['pv']}{TerminalColors.RESET}")
         
         return "\n".join(output)
-    
     def cmd_eval(self, args):
         """Evaluate position"""
         return self.cmd_analyze(['20'])
@@ -4788,55 +5061,43 @@ class ChessTerminal:
     
     def cmd_boardedit(self, args=""):
         try:
-                # Use current board if available
-                board = None
-                if hasattr(self, "board") and self.board:
-                        board = self.board
-
-                # Run board editor with curses wrapper
-                def run_editor(stdscr):
-                        from BoardEditorFix import App as BoardEditor
-                        editor = BoardEditor(
-                                stdscr=stdscr,
-                                board=board.copy() if board else chess.Board(),
-                                save_path=None,
-                                engine_path="./stockfish"
-                        )
-                        try:
-                                editor.loop()
-                        finally:
-                                editor.close()
-                        return editor.board
-
-                # Run editor
                 if not CURSES_AVAILABLE:
                         print(f"{TerminalColors.RED}curses not available{TerminalColors.RESET}")
                         return
-                        
-                new_board = curses.wrapper(run_editor)
 
-                # CRITICAL: Reset entire game after board edit
-                if new_board:
-                        self.board = new_board
-                        
-                        # Reset game completely (like database load)
-                        self.game = chess.pgn.Game()
-                        self.game.headers["FEN"] = self.board.fen()
-                        self.game.headers["SetUp"] = "1"
-                        self.game_node = self.game
-                        self.mainline_moves = []
-                        self.move_index = 0
-                        self.start_board = self.board.copy()
+                # Start from current position
+                board = self.board.copy() if getattr(self, "board", None) else chess.Board()
+
+                # Use the built-in board editor
+                editor = BoardEditorManager(
+                        terminal=self,
+                        board=board,
+                        engine_path="/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe"
+                )
+
+                editor.run()
+
+                # Retrieve edited board
+                self.board = editor.board.copy()
+
+                # Reset game history
+                self.game = chess.pgn.Game()
+                self.game.headers["FEN"] = self.board.fen()
+                self.game.headers["SetUp"] = "1"
+                self.game_node = self.game
+                self.mainline_moves = []
+                self.move_index = 0
+                self.start_board = self.board.copy()
 
                 print(f"{TerminalColors.GREEN}Returned from board editor{TerminalColors.RESET}")
                 print(f"{TerminalColors.YELLOW}Game history has been reset{TerminalColors.RESET}")
+
                 self.display_board()
 
         except Exception as e:
                 print(f"{TerminalColors.RED}Board editor error: {e}{TerminalColors.RESET}")
                 import traceback
                 traceback.print_exc()
-
     def setup_readline(self):
         """Setup command history with up/down arrows"""
         try:
@@ -4892,7 +5153,7 @@ class ChessTerminal:
         print(f"{TerminalColors.CYAN}Analyzing {len(moves)} moves...{TerminalColors.RESET}")
 
         # Create & run Macbeth directly
-        self.macbeth = MacbethAnalysis(self.game, depth=depth, engine_path="./stockfish")
+        self.macbeth = MacbethAnalysis(self.game, depth=depth, engine_path="/cygdrive/c/Users/Daniel Lihaciu/Desktop/shchess/stockfish.exe")
         
         # Set macbeth analysis on move navigator so it can display results during navigation
         if hasattr(self, 'move_navigator'):
